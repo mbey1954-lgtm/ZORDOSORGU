@@ -1,38 +1,30 @@
 import os
 import re
 import zipfile
-import json
-from fastapi import FastAPI, Request, HTTPException
+import asyncio
+from fastapi import FastAPI, HTTPException
 from starlette.responses import Response
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart
 
 # ───────── AYARLAR ─────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BASE_URL = os.environ.get("BASE_URL")
-
-if not BOT_TOKEN or not BASE_URL:
-    raise RuntimeError("BOT_TOKEN ve BASE_URL gerekli")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN yok")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-STATE_FILE = os.path.join(DATA_DIR, "state.json")
-if not os.path.exists(STATE_FILE):
-    with open(STATE_FILE, "w") as f:
-        json.dump({}, f)
+# ───────── FASTAPI ─────────
+app = FastAPI(title="ZordoBotAPI")
 
-def load_state():
-    with open(STATE_FILE, "r") as f:
-        return json.load(f)
+# ───────── AIROGRAM ─────────
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
 
-def save_state(s):
-    with open(STATE_FILE, "w") as f:
-        json.dump(s, f)
-
-def clean_name(x: str) -> str:
-    x = x.lower().strip()
-    return re.sub(r"[^a-z0-9_]", "", x)
+def clean_name(name: str) -> str:
+    name = name.lower().strip()
+    return re.sub(r"[^a-z0-9_]", "", name)
 
 def normalize(text: str) -> str:
     return text.replace(";", "|").replace(",", "|").replace("\t", "|")
@@ -50,15 +42,10 @@ def combine_files(paths):
             pass
     return "\n".join(out) + "\n"
 
-# ───────── FASTAPI ─────────
-app = FastAPI(title="ZordoBotAPI")
-
-# ───────── TELEGRAM APP ─────────
-tg_app = Application.builder().token(BOT_TOKEN).build()
-
-# ───────── BOT KOMUTLARI ─────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+# ───────── BOT KOMUT ─────────
+@dp.message(CommandStart())
+async def start(msg: types.Message):
+    await msg.answer(
         "🤖 Bot aktif\n\n"
         "ZIP / TXT / CSV / TSV / LOG gönder\n"
         "Dosya adı = API adı\n\n"
@@ -66,16 +53,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "250ksgksorgu.zip → /search/250ksgksorgu?q=123"
     )
 
-async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    fname = doc.file_name.lower()
-    base = clean_name(os.path.splitext(doc.file_name)[0])
+@dp.message()
+async def handle_file(msg: types.Message):
+    if not msg.document:
+        return
 
-    msg = await update.message.reply_text("📥 İşleniyor...")
+    fname = msg.document.file_name.lower()
+    base = clean_name(os.path.splitext(msg.document.file_name)[0])
+    tmp = os.path.join(DATA_DIR, f"tmp_{msg.document.file_id}")
 
-    file = await doc.get_file()
-    tmp = os.path.join(DATA_DIR, f"tmp_{doc.file_id}")
-    await file.download_to_drive(tmp)
+    await bot.download(msg.document, destination=tmp)
 
     files = []
     unzip_dir = None
@@ -94,22 +81,18 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif fname.endswith((".txt", ".csv", ".tsv", ".log")):
         files.append(tmp)
     else:
-        await msg.edit_text("❌ Desteklenmeyen dosya")
+        await msg.answer("❌ Desteklenmeyen dosya")
         return
 
     if not files:
-        await msg.edit_text("❌ Dosya bulunamadı")
+        await msg.answer("❌ Dosya bulunamadı")
         return
 
-    final_path = os.path.join(DATA_DIR, f"{base}.txt")
+    final_txt = os.path.join(DATA_DIR, f"{base}.txt")
     content = combine_files(files)
 
-    with open(final_path, "w", encoding="utf-8", buffering=32768) as f:
+    with open(final_txt, "w", encoding="utf-8", buffering=32768) as f:
         f.write(content)
-
-    state = load_state()
-    state[base] = True
-    save_state(state)
 
     try:
         os.remove(tmp)
@@ -121,15 +104,9 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    await msg.edit_text(
-        f"✅ API hazır\n\n"
-        f"{BASE_URL}/search/{base}?q=kelime"
-    )
+    await msg.answer(f"✅ API hazır\n/search/{base}?q=kelime")
 
-tg_app.add_handler(CommandHandler("start", start))
-tg_app.add_handler(MessageHandler(filters.Document.ALL, upload))
-
-# ───────── SEARCH API ─────────
+# ───────── API ─────────
 @app.get("/search/{dataset}")
 def search(dataset: str, q: str = ""):
     dataset = clean_name(dataset)
@@ -147,34 +124,20 @@ def search(dataset: str, q: str = ""):
             if line and q in line.lower():
                 results.append(line)
 
-    if not results:
-        return {"count": 0, "results": []}
-
     if len(results) > 50:
         return Response(
             content="\n".join(results),
             media_type="text/plain",
-            headers={
-                "Content-Disposition": f"attachment; filename={dataset}_sonuc.txt"
-            }
+            headers={"Content-Disposition": f"attachment; filename={dataset}_sonuc.txt"}
         )
 
     return {"count": len(results), "results": results}
 
-# ───────── WEBHOOK ─────────
-@app.on_event("startup")
-async def startup():
-    await tg_app.initialize()
-    await tg_app.bot.set_webhook(f"{BASE_URL}/webhook", drop_pending_updates=True)
-
-@app.post("/webhook")
-async def webhook(req: Request):
-    data = await req.json()
-    update = Update.de_json(data, tg_app.bot)
-    if update:
-        await tg_app.process_update(update)
-    return {"ok": True}
-
 @app.get("/")
 def root():
     return {"status": "online"}
+
+# ───────── BOT BAŞLAT ─────────
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(dp.start_polling(bot))
