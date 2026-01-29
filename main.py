@@ -4,24 +4,25 @@ import zipfile
 import asyncio
 from fastapi import FastAPI, HTTPException
 from starlette.responses import Response
+
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart
+# executor yerine doğrudan dp üzerinden polling başlatacağız (hata vermemesi için)
 
 # ───────── AYARLAR ─────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN yok")
+    # Render'da Environment Variable olarak BOT_TOKEN eklemeyi unutma!
+    print("HATA: BOT_TOKEN bulunamadı!")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ───────── FASTAPI ─────────
 app = FastAPI(title="ZordoBotAPI")
 
-# ───────── AIROGRAM ─────────
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
+bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
+dp = Dispatcher(bot) if bot else None
 
+# ───────── YARDIMCI ─────────
 def clean_name(name: str) -> str:
     name = name.lower().strip()
     return re.sub(r"[^a-z0-9_]", "", name)
@@ -43,68 +44,68 @@ def combine_files(paths):
     return "\n".join(out) + "\n"
 
 # ───────── BOT KOMUT ─────────
-@dp.message(CommandStart())
-async def start(msg: types.Message):
-    await msg.answer(
-        "🤖 Bot aktif\n\n"
-        "ZIP / TXT / CSV / TSV / LOG gönder\n"
-        "Dosya adı = API adı\n\n"
-        "Örnek:\n"
-        "250ksgksorgu.zip → /search/250ksgksorgu?q=123"
-    )
+if dp:
+    @dp.message_handler(commands=["start"])
+    async def start(msg: types.Message):
+        await msg.reply(
+            "🤖 Bot aktif\n\n"
+            "ZIP / TXT / CSV / TSV / LOG gönder\n"
+            "Dosya adı = API adı\n\n"
+            "Örnek:\n"
+            "250ksgksorgu.zip → /search/250ksgksorgu?q=123"
+        )
 
-@dp.message()
-async def handle_file(msg: types.Message):
-    if not msg.document:
-        return
+    @dp.message_handler(content_types=types.ContentType.DOCUMENT)
+    async def handle_file(msg: types.Message):
+        doc = msg.document
+        fname = doc.file_name.lower()
+        base = clean_name(os.path.splitext(doc.file_name)[0])
 
-    fname = msg.document.file_name.lower()
-    base = clean_name(os.path.splitext(msg.document.file_name)[0])
-    tmp = os.path.join(DATA_DIR, f"tmp_{msg.document.file_id}")
+        tmp = os.path.join(DATA_DIR, f"tmp_{doc.file_id}")
+        await doc.download(destination_file=tmp)
 
-    await bot.download(msg.document, destination=tmp)
+        files = []
+        unzip_dir = None
 
-    files = []
-    unzip_dir = None
+        if fname.endswith(".zip"):
+            unzip_dir = os.path.join(DATA_DIR, f"unz_{base}")
+            os.makedirs(unzip_dir, exist_ok=True)
 
-    if fname.endswith(".zip"):
-        unzip_dir = os.path.join(DATA_DIR, f"unz_{base}")
-        os.makedirs(unzip_dir, exist_ok=True)
-        with zipfile.ZipFile(tmp, "r") as z:
-            z.extractall(unzip_dir)
+            with zipfile.ZipFile(tmp, "r") as z:
+                z.extractall(unzip_dir)
 
-        for root, _, names in os.walk(unzip_dir):
-            for n in names:
-                if n.lower().endswith((".txt", ".csv", ".tsv", ".log")):
-                    files.append(os.path.join(root, n))
+            for root, _, names in os.walk(unzip_dir):
+                for n in names:
+                    if n.lower().endswith((".txt", ".csv", ".tsv", ".log")):
+                        files.append(os.path.join(root, n))
 
-    elif fname.endswith((".txt", ".csv", ".tsv", ".log")):
-        files.append(tmp)
-    else:
-        await msg.answer("❌ Desteklenmeyen dosya")
-        return
+        elif fname.endswith((".txt", ".csv", ".tsv", ".log")):
+            files.append(tmp)
+        else:
+            await msg.reply("❌ Desteklenmeyen dosya")
+            return
 
-    if not files:
-        await msg.answer("❌ Dosya bulunamadı")
-        return
+        if not files:
+            await msg.reply("❌ Dosya bulunamadı")
+            return
 
-    final_txt = os.path.join(DATA_DIR, f"{base}.txt")
-    content = combine_files(files)
+        final_txt = os.path.join(DATA_DIR, f"{base}.txt")
+        content = combine_files(files)
 
-    with open(final_txt, "w", encoding="utf-8", buffering=32768) as f:
-        f.write(content)
+        with open(final_txt, "w", encoding="utf-8") as f:
+            f.write(content)
 
-    try:
-        os.remove(tmp)
-        if unzip_dir:
-            for r, d, fs in os.walk(unzip_dir, topdown=False):
-                for x in fs: os.remove(os.path.join(r, x))
-                for x in d: os.rmdir(os.path.join(r, x))
-            os.rmdir(unzip_dir)
-    except:
-        pass
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+            if unzip_dir:
+                for r, d, fs in os.walk(unzip_dir, topdown=False):
+                    for x in fs: os.remove(os.path.join(r, x))
+                    for x in d: os.rmdir(os.path.join(r, x))
+                os.rmdir(unzip_dir)
+        except:
+            pass
 
-    await msg.answer(f"✅ API hazır\n/search/{base}?q=kelime")
+        await msg.reply(f"✅ API hazır\n/search/{base}?q=kelime")
 
 # ───────── API ─────────
 @app.get("/search/{dataset}")
@@ -118,7 +119,7 @@ def search(dataset: str, q: str = ""):
     q = q.lower().strip()
     results = []
 
-    with open(path, "r", encoding="utf-8", errors="ignore", buffering=32768) as f:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if line and q in line.lower():
@@ -128,7 +129,9 @@ def search(dataset: str, q: str = ""):
         return Response(
             content="\n".join(results),
             media_type="text/plain",
-            headers={"Content-Disposition": f"attachment; filename={dataset}_sonuc.txt"}
+            headers={
+                "Content-Disposition": f"attachment; filename={dataset}_sonuc.txt"
+            }
         )
 
     return {"count": len(results), "results": results}
@@ -140,4 +143,6 @@ def root():
 # ───────── BOT BAŞLAT ─────────
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(dp.start_polling(bot))
+    if dp:
+        # Render/FastAPI ile en uyumlu başlatma yöntemi:
+        asyncio.create_task(dp.start_polling())
