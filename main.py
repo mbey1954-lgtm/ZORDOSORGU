@@ -2,28 +2,55 @@ import os
 import re
 import zipfile
 import asyncio
-from fastapi import FastAPI, HTTPException
-from starlette.responses import Response
+import time
+from typing import List
+from fastapi import FastAPI, Request
+from fastapi.responses import Response, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
 
-# ───────── AYARLAR ─────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# ───────── CONFIG ─────────
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 
 DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
+TMP_DIR = "tmp"
 
-app = FastAPI(title="ZordoBotAPI_V2")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(TMP_DIR, exist_ok=True)
+
+MAX_RESULTS = 2000
+TXT_THRESHOLD = 50
+MAX_FILE_SIZE_MB = 50
+
+app = FastAPI(title="ZordoAPI_ULTIMATE")
+
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 
-# ───────── YARDIMCI ─────────
+# ───────── GLOBAL ERROR SHIELD ─────────
+class SafetyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as e:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "error": "internal_error",
+                    "message": "İşlem güvenli şekilde durduruldu",
+                    "detail": str(e)
+                }
+            )
+
+app.add_middleware(SafetyMiddleware)
+
+# ───────── HELPERS ─────────
 def clean_name(name: str) -> str:
-    name = name.lower().strip()
-    return re.sub(r"[^a-z0-9_]", "", name)
+    return re.sub(r"[^a-z0-9_]", "", name.lower().strip())
 
 def normalize_line(line: str) -> str:
     line = line.strip()
@@ -35,96 +62,116 @@ def normalize_line(line: str) -> str:
         line = line.replace("||", "|")
     return line
 
-def process_and_combine(file_paths):
-    out = []
-    for p in file_paths:
+def safe_read_and_combine(files: List[str]) -> str:
+    output = []
+    for path in files:
         try:
-            with open(p, "rb") as f:
+            with open(path, "rb") as f:
                 for raw in f:
                     line = raw.decode("utf-8", errors="ignore")
                     n = normalize_line(line)
                     if n:
-                        out.append(n)
+                        output.append(n)
         except:
             continue
-    return "\n".join(out)
+    return "\n".join(output)
+
+def safe_cleanup(path: str):
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+        elif os.path.isdir(path):
+            for r, d, f in os.walk(path, topdown=False):
+                for x in f:
+                    os.remove(os.path.join(r, x))
+                for x in d:
+                    os.rmdir(os.path.join(r, x))
+            os.rmdir(path)
+    except:
+        pass
 
 # ───────── BOT ─────────
 @dp.message(Command("start"))
 async def start_cmd(message: Message):
     await message.answer(
-        "🚀 Zordo API Aktif\n\n"
+        "🚀 Zordo Ultimate API\n\n"
         "📂 ZIP / TXT / CSV / TSV / LOG\n"
-        "🔗 Otomatik API\n\n"
+        "🧠 Otomatik normalize\n"
+        "🔗 Güvenli API\n\n"
         "Dosyayı belge olarak gönder."
     )
 
 @dp.message(F.document)
 async def handle_document(message: Message):
-    doc = message.document
-    fname = doc.file_name.lower()
+    try:
+        doc = message.document
 
-    if not fname.endswith((".zip", ".txt", ".csv", ".tsv", ".log")):
-        await message.answer("❌ Desteklenmeyen dosya.")
-        return
+        if doc.file_size and doc.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+            await message.answer("❌ Dosya çok büyük.")
+            return
 
-    base_name = clean_name(os.path.splitext(doc.file_name)[0])
-    final_path = os.path.join(DATA_DIR, f"{base_name}.txt")
+        fname = doc.file_name.lower()
+        if not fname.endswith((".zip", ".txt", ".csv", ".tsv", ".log")):
+            await message.answer("❌ Desteklenmeyen dosya.")
+            return
 
-    status = await message.answer("⚙️ İşleniyor...")
+        dataset = clean_name(os.path.splitext(doc.file_name)[0])
+        final_path = os.path.join(DATA_DIR, f"{dataset}.txt")
 
-    temp_path = os.path.join(DATA_DIR, f"temp_{doc.file_id}")
-    await bot.download(doc, destination=temp_path)
+        status = await message.answer("⚙️ İşleniyor...")
 
-    extracted = []
-    unzip_dir = os.path.join(DATA_DIR, f"unzip_{doc.file_id}")
+        tmp_file = os.path.join(TMP_DIR, f"{doc.file_id}")
+        await bot.download(doc, destination=tmp_file)
 
-    if fname.endswith(".zip"):
-        os.makedirs(unzip_dir, exist_ok=True)
-        try:
-            with zipfile.ZipFile(temp_path) as z:
+        files = []
+
+        if fname.endswith(".zip"):
+            unzip_dir = os.path.join(TMP_DIR, f"unzip_{doc.file_id}")
+            os.makedirs(unzip_dir, exist_ok=True)
+
+            with zipfile.ZipFile(tmp_file) as z:
                 z.extractall(unzip_dir)
+
             for r, _, fs in os.walk(unzip_dir):
                 for f in fs:
                     if f.lower().endswith((".txt", ".csv", ".tsv", ".log")):
-                        extracted.append(os.path.join(r, f))
-        except:
-            await status.edit_text("❌ ZIP açılamadı.")
+                        files.append(os.path.join(r, f))
+
+            safe_cleanup(unzip_dir)
+        else:
+            files.append(tmp_file)
+
+        if not files:
+            await status.edit_text("❌ Uygun veri yok.")
+            safe_cleanup(tmp_file)
             return
-    else:
-        extracted.append(temp_path)
 
-    if not extracted:
-        await status.edit_text("❌ Veri bulunamadı.")
-        return
+        data = safe_read_and_combine(files)
+        with open(final_path, "w", encoding="utf-8") as f:
+            f.write(data)
 
-    combined = process_and_combine(extracted)
-    with open(final_path, "w", encoding="utf-8") as f:
-        f.write(combined)
+        safe_cleanup(tmp_file)
 
-    # Temizlik
-    if os.path.exists(temp_path):
-        os.remove(temp_path)
-    if os.path.exists(unzip_dir):
-        for r, d, fs in os.walk(unzip_dir, topdown=False):
-            for x in fs: os.remove(os.path.join(r, x))
-            for x in d: os.rmdir(os.path.join(r, x))
-        os.rmdir(unzip_dir)
+        await status.edit_text(
+            f"✅ API Hazır\n\n"
+            f"📂 Dataset:\n`{dataset}`\n\n"
+            f"🔗 {BASE_URL}/search/{dataset}?q=kelime"
+        )
 
-    api_link = f"{BASE_URL}/search/{base_name}?q=kelime"
-    await status.edit_text(
-        f"✅ API Hazır\n\n"
-        f"📂 Dataset: `{base_name}`\n"
-        f"🔗 {api_link}"
-    )
+    except Exception as e:
+        await message.answer(f"❌ Hata güvenli şekilde yakalandı:\n{e}")
 
 # ───────── API ─────────
 @app.get("/")
 def home():
-    return {"status": "online", "docs": f"{BASE_URL}/docs"}
+    return {
+        "status": "online",
+        "system": "Zordo Ultimate",
+        "time": int(time.time())
+    }
 
 @app.get("/search/{dataset}")
-async def search_api(dataset: str, q: str = ""):
+async def search(dataset: str, q: str = ""):
     if not q:
         return {"error": "q parametresi zorunlu"}
 
@@ -135,24 +182,28 @@ async def search_api(dataset: str, q: str = ""):
 
     for ds in datasets:
         path = os.path.join(DATA_DIR, f"{ds}.txt")
-        if not os.path.exists(path):
+        if not os.path.isfile(path):
             continue
 
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if query in line.lower():
-                    results.append(f"{ds}|{line.strip()}")
-                if len(results) >= 2000:
-                    break
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if query in line.lower():
+                        results.append(f"{ds}|{line.strip()}")
+                    if len(results) >= MAX_RESULTS:
+                        break
+        except:
+            continue
 
     if not results:
         return {
             "datasets": datasets,
             "query": query,
-            "total": 0
+            "total": 0,
+            "message": "Sonuç yok veya dataset bulunamadı"
         }
 
-    if len(results) > 50:
+    if len(results) > TXT_THRESHOLD:
         return Response(
             "\n".join(results),
             media_type="text/plain",
