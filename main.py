@@ -1,8 +1,11 @@
 import os
 import re
 import zipfile
+import gzip
+import shutil
 import asyncio
 import time
+import secrets
 from typing import List
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, JSONResponse
@@ -14,10 +17,11 @@ from aiogram.types import Message
 
 # ───────── CONFIG ─────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
-
+BASE_URL = os.environ.get("BASE_URL", "http://localhost").rstrip("/")
 DATA_DIR = "data"
 TMP_DIR = "tmp"
+API_KEYS_FILE = "apikeys.txt"
+ADMIN_IDS = [8538972848]  # Telegram ID ile admin ekle
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
@@ -27,7 +31,6 @@ TXT_THRESHOLD = 50
 MAX_FILE_SIZE_MB = 50
 
 app = FastAPI(title="ZordoAPI_ULTIMATE")
-
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 
@@ -45,7 +48,6 @@ class SafetyMiddleware(BaseHTTPMiddleware):
                     "detail": str(e)
                 }
             )
-
 app.add_middleware(SafetyMiddleware)
 
 # ───────── HELPERS ─────────
@@ -66,12 +68,18 @@ def safe_read_and_combine(files: List[str]) -> str:
     output = []
     for path in files:
         try:
-            with open(path, "rb") as f:
-                for raw in f:
-                    line = raw.decode("utf-8", errors="ignore")
-                    n = normalize_line(line)
-                    if n:
-                        output.append(n)
+            if path.endswith(".gz"):
+                with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        n = normalize_line(line)
+                        if n:
+                            output.append(n)
+            else:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        n = normalize_line(line)
+                        if n:
+                            output.append(n)
         except:
             continue
     return "\n".join(output)
@@ -81,110 +89,119 @@ def safe_cleanup(path: str):
         if os.path.isfile(path):
             os.remove(path)
         elif os.path.isdir(path):
-            for r, d, f in os.walk(path, topdown=False):
-                for x in f:
-                    os.remove(os.path.join(r, x))
-                for x in d:
-                    os.rmdir(os.path.join(r, x))
-            os.rmdir(path)
+            shutil.rmtree(path)
     except:
         pass
+
+def generate_api_key() -> str:
+    key = secrets.token_hex(16)
+    with open(API_KEYS_FILE, "a") as f:
+        f.write(key + "\n")
+    return key
+
+def is_valid_key(key: str) -> bool:
+    if not os.path.isfile(API_KEYS_FILE):
+        return False
+    with open(API_KEYS_FILE, "r") as f:
+        return key.strip() in [line.strip() for line in f.readlines()]
 
 # ───────── BOT ─────────
 @dp.message(Command("start"))
 async def start_cmd(message: Message):
     await message.answer(
-        "🚀 Zordo Ultimate API\n\n"
-        "📂 ZIP / TXT / CSV / TSV / LOG\n"
+        "🚀 Zordo Ultimate API\n"
+        "📂 ZIP / GZ / TXT / CSV / TSV / LOG\n"
         "🧠 Otomatik normalize\n"
-        "🔗 Güvenli API\n\n"
+        "🔗 Güvenli API key\n"
+        "⚙️ Admin kontrolü\n\n"
         "Dosyayı belge olarak gönder."
     )
 
 @dp.message(F.document)
 async def handle_document(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ Yetkisiz erişim.")
+        return
     try:
         doc = message.document
-
         if doc.file_size and doc.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
             await message.answer("❌ Dosya çok büyük.")
             return
-
         fname = doc.file_name.lower()
-        if not fname.endswith((".zip", ".txt", ".csv", ".tsv", ".log")):
+        if not fname.endswith((".zip", ".txt", ".csv", ".tsv", ".log", ".gz")):
             await message.answer("❌ Desteklenmeyen dosya.")
             return
-
         dataset = clean_name(os.path.splitext(doc.file_name)[0])
         final_path = os.path.join(DATA_DIR, f"{dataset}.txt")
-
         status = await message.answer("⚙️ İşleniyor...")
-
         tmp_file = os.path.join(TMP_DIR, f"{doc.file_id}")
         await bot.download(doc, destination=tmp_file)
-
         files = []
-
         if fname.endswith(".zip"):
             unzip_dir = os.path.join(TMP_DIR, f"unzip_{doc.file_id}")
             os.makedirs(unzip_dir, exist_ok=True)
-
             with zipfile.ZipFile(tmp_file) as z:
                 z.extractall(unzip_dir)
-
             for r, _, fs in os.walk(unzip_dir):
                 for f in fs:
-                    if f.lower().endswith((".txt", ".csv", ".tsv", ".log")):
+                    if f.lower().endswith((".txt", ".csv", ".tsv", ".log", ".gz")):
                         files.append(os.path.join(r, f))
-
             safe_cleanup(unzip_dir)
         else:
             files.append(tmp_file)
-
         if not files:
             await status.edit_text("❌ Uygun veri yok.")
             safe_cleanup(tmp_file)
             return
-
         data = safe_read_and_combine(files)
         with open(final_path, "w", encoding="utf-8") as f:
             f.write(data)
-
         safe_cleanup(tmp_file)
-
+        api_key = generate_api_key()
         await status.edit_text(
             f"✅ API Hazır\n\n"
-            f"📂 Dataset:\n`{dataset}`\n\n"
-            f"🔗 {BASE_URL}/search/{dataset}?q=kelime"
+            f"📂 Dataset: `{dataset}`\n"
+            f"🔑 API Key: `{api_key}`\n"
+            f"🔗 Endpoint: {BASE_URL}/search/{dataset}?q=kelime&key={api_key}"
         )
-
     except Exception as e:
         await message.answer(f"❌ Hata güvenli şekilde yakalandı:\n{e}")
+
+@dp.message(Command("sil"))
+async def delete_dataset(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ Yetkisiz erişim.")
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❌ Kullanım: /sil dataset_adi")
+        return
+    dataset = clean_name(args[1])
+    path = os.path.join(DATA_DIR, f"{dataset}.txt")
+    if os.path.isfile(path):
+        os.remove(path)
+        await message.answer(f"✅ Dataset silindi: {dataset}")
+    else:
+        await message.answer(f"❌ Dataset bulunamadı: {dataset}")
 
 # ───────── API ─────────
 @app.get("/")
 def home():
-    return {
-        "status": "online",
-        "system": "Zordo Ultimate",
-        "time": int(time.time())
-    }
+    return {"status": "online", "system": "Zordo Ultimate", "time": int(time.time())}
 
 @app.get("/search/{dataset}")
-async def search(dataset: str, q: str = ""):
+async def search(dataset: str, q: str = "", key: str = ""):
+    if not is_valid_key(key):
+        return {"error": "invalid_api_key"}
     if not q:
         return {"error": "q parametresi zorunlu"}
-
     datasets = [clean_name(x) for x in dataset.split(",")]
     query = q.lower().strip()
-
     results = []
-
     for ds in datasets:
         path = os.path.join(DATA_DIR, f"{ds}.txt")
         if not os.path.isfile(path):
             continue
-
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
@@ -194,34 +211,22 @@ async def search(dataset: str, q: str = ""):
                         break
         except:
             continue
-
     if not results:
-        return {
-            "datasets": datasets,
-            "query": query,
-            "total": 0,
-            "message": "Sonuç yok veya dataset bulunamadı"
-        }
-
+        return {"datasets": datasets, "query": query, "total": 0, "message": "Sonuç yok"}
     if len(results) > TXT_THRESHOLD:
-        return Response(
-            "\n".join(results),
-            media_type="text/plain",
-            headers={
-                "Content-Disposition":
-                f"attachment; filename=sonuc_{query}.txt"
-            }
-        )
-
-    return {
-        "datasets": datasets,
-        "query": query,
-        "total": len(results),
-        "results": results
-    }
+        return Response("\n".join(results),
+                        media_type="text/plain",
+                        headers={"Content-Disposition": f"attachment; filename=sonuc_{query}.txt"})
+    return {"datasets": datasets, "query": query, "total": len(results), "results": results}
 
 # ───────── STARTUP ─────────
 @app.on_event("startup")
 async def startup():
     if bot:
         asyncio.create_task(dp.start_polling(bot))
+
+# ───────── RUN RENDER UYUMLU ─────────
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
