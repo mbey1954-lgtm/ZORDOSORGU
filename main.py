@@ -19,7 +19,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost").rstrip("/")
 DATA_DIR = "data"
 TMP_DIR = "tmp"
-ADMIN_IDS = [123456789]  # Telegram ID ile admin ekle
+ADMIN_IDS = [8538972848]  # SENİN TELEGRAM ID'Nİ EKLEDİK
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
@@ -107,6 +107,7 @@ async def handle_document(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("❌ Yetkisiz erişim.")
         return
+
     try:
         doc = message.document
         if doc.file_size and doc.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
@@ -116,12 +117,16 @@ async def handle_document(message: Message):
         if not fname.endswith((".zip", ".txt", ".csv", ".tsv", ".log", ".gz")):
             await message.answer("❌ Desteklenmeyen dosya.")
             return
+
         dataset = clean_name(os.path.splitext(doc.file_name)[0])
         final_path = os.path.join(DATA_DIR, f"{dataset}.txt")
         status = await message.answer("⚙️ İşleniyor...")
+
         tmp_file = os.path.join(TMP_DIR, f"{doc.file_id}")
         await bot.download(doc, destination=tmp_file)
+
         files = []
+
         if fname.endswith(".zip"):
             unzip_dir = os.path.join(TMP_DIR, f"unzip_{doc.file_id}")
             os.makedirs(unzip_dir, exist_ok=True)
@@ -134,14 +139,17 @@ async def handle_document(message: Message):
             safe_cleanup(unzip_dir)
         else:
             files.append(tmp_file)
+
         if not files:
             await status.edit_text("❌ Uygun veri yok.")
             safe_cleanup(tmp_file)
             return
+
         data = safe_read_and_combine(files)
         with open(final_path, "w", encoding="utf-8") as f:
             f.write(data)
         safe_cleanup(tmp_file)
+
         await status.edit_text(
             f"✅ API Hazır\n\n"
             f"📂 Dataset: `{dataset}`\n"
@@ -155,10 +163,12 @@ async def delete_dataset(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("❌ Yetkisiz erişim.")
         return
+
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await message.answer("❌ Kullanım: /sil dataset_adi")
         return
+
     dataset = clean_name(args[1])
     path = os.path.join(DATA_DIR, f"{dataset}.txt")
     if os.path.isfile(path):
@@ -176,13 +186,16 @@ def home():
 async def search(dataset: str, q: str = ""):
     if not q:
         return {"error": "q parametresi zorunlu"}
+
     datasets = [clean_name(x) for x in dataset.split(",")]
     query = q.lower().strip()
     results = []
+
     for ds in datasets:
         path = os.path.join(DATA_DIR, f"{ds}.txt")
         if not os.path.isfile(path):
             continue
+
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
@@ -192,12 +205,17 @@ async def search(dataset: str, q: str = ""):
                         break
         except:
             continue
+
     if not results:
         return {"datasets": datasets, "query": query, "total": 0, "message": "Sonuç yok"}
+
     if len(results) > TXT_THRESHOLD:
-        return Response("\n".join(results),
-                        media_type="text/plain",
-                        headers={"Content-Disposition": f"attachment; filename=sonuc_{query}.txt"})
+        return Response(
+            "\n".join(results),
+            media_type="text/plain",
+            headers={"Content-Disposition": f"attachment; filename=sonuc_{query}.txt"}
+        )
+
     return {"datasets": datasets, "query": query, "total": len(results), "results": results}
 
 # ───────── STARTUP ─────────
