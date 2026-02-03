@@ -5,7 +5,6 @@ import gzip
 import shutil
 import asyncio
 import time
-import secrets
 from typing import List
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, JSONResponse
@@ -20,8 +19,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost").rstrip("/")
 DATA_DIR = "data"
 TMP_DIR = "tmp"
-API_KEYS_FILE = "apikeys.txt"
-ADMIN_IDS = [8538972848]  # Telegram ID ile admin ekle
+ADMIN_IDS = [123456789]  # Telegram ID ile admin ekle
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
@@ -93,18 +91,6 @@ def safe_cleanup(path: str):
     except:
         pass
 
-def generate_api_key() -> str:
-    key = secrets.token_hex(16)
-    with open(API_KEYS_FILE, "a") as f:
-        f.write(key + "\n")
-    return key
-
-def is_valid_key(key: str) -> bool:
-    if not os.path.isfile(API_KEYS_FILE):
-        return False
-    with open(API_KEYS_FILE, "r") as f:
-        return key.strip() in [line.strip() for line in f.readlines()]
-
 # ───────── BOT ─────────
 @dp.message(Command("start"))
 async def start_cmd(message: Message):
@@ -112,7 +98,6 @@ async def start_cmd(message: Message):
         "🚀 Zordo Ultimate API\n"
         "📂 ZIP / GZ / TXT / CSV / TSV / LOG\n"
         "🧠 Otomatik normalize\n"
-        "🔗 Güvenli API key\n"
         "⚙️ Admin kontrolü\n\n"
         "Dosyayı belge olarak gönder."
     )
@@ -157,12 +142,10 @@ async def handle_document(message: Message):
         with open(final_path, "w", encoding="utf-8") as f:
             f.write(data)
         safe_cleanup(tmp_file)
-        api_key = generate_api_key()
         await status.edit_text(
             f"✅ API Hazır\n\n"
             f"📂 Dataset: `{dataset}`\n"
-            f"🔑 API Key: `{api_key}`\n"
-            f"🔗 Endpoint: {BASE_URL}/search/{dataset}?q=kelime&key={api_key}"
+            f"🔗 Endpoint: {BASE_URL}/search/{dataset}?q=kelime"
         )
     except Exception as e:
         await message.answer(f"❌ Hata güvenli şekilde yakalandı:\n{e}")
@@ -190,9 +173,7 @@ def home():
     return {"status": "online", "system": "Zordo Ultimate", "time": int(time.time())}
 
 @app.get("/search/{dataset}")
-async def search(dataset: str, q: str = "", key: str = ""):
-    if not is_valid_key(key):
-        return {"error": "invalid_api_key"}
+async def search(dataset: str, q: str = ""):
     if not q:
         return {"error": "q parametresi zorunlu"}
     datasets = [clean_name(x) for x in dataset.split(",")]
